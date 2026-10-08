@@ -470,8 +470,18 @@ class AudioSeparationWorker(QThread):
             return
 
         ref = wav.mean(0)
-        wav = wav - ref.mean()
-        wav = wav / ref.std()
+        ref_mean = float(ref.mean())
+        ref_std = float(ref.std())
+
+        # 静音/近静音输入会导致归一化除零 (std=0) 产生 NaN, 这里提前拦截
+        if not np.isfinite(ref_std) or ref_std < 1e-8:
+            self.error_occurred.emit(
+                f"该音频为静音或无有效内容，无法进行分离:\n{self._input_path}"
+            )
+            return
+
+        wav = wav - ref_mean
+        wav = wav / ref_std
 
         self.progress_text.emit("正在进行分离 (可能需要 1~5 分钟)...")
         self.progress_value.emit(30)
@@ -482,7 +492,7 @@ class AudioSeparationWorker(QThread):
             overlap=self._overlap, progress=False,
         )[0]
 
-        sources = sources * ref.std() + ref.mean()
+        sources = sources * ref_std + ref_mean
 
         self.progress_text.emit("保存分离结果...")
         self.progress_value.emit(80)
@@ -923,6 +933,9 @@ class MainWindow(QMainWindow):
 
             ext = Path(filepath).suffix.lower()
 
+            # 清理上一个文件遗留的临时产物 (必须在提取新音频之前执行)
+            self._cleanup_temp_dir()
+
             # 视频文件: 先提取音频
             if ext in VIDEO_EXTS:
                 self._status_label.setText("正在从视频提取音频...")
@@ -967,7 +980,6 @@ class MainWindow(QMainWindow):
             self._progress_bar.setFormat("就绪")
             self._status_label.setText(f"已加载: {filename}")
             self._status_label.setStyleSheet("font-size: 11px; color: #27AE60;")
-            self._cleanup_temp_dir()
 
         except FileNotFoundError as e:
             QMessageBox.critical(self, "文件错误", str(e))
@@ -1044,7 +1056,13 @@ class MainWindow(QMainWindow):
     def _on_start_separation(self):
         if not self._input_file:
             return
-        self._cleanup_temp_dir()
+        if not os.path.isfile(self._input_file):
+            QMessageBox.critical(self, "文件错误",
+                                  f"输入文件已不存在:\n{self._input_file}\n请重新导入文件。")
+            self._status_label.setText("输入文件丢失，请重新导入")
+            self._status_label.setStyleSheet("font-size: 11px; color: #E74C3C;")
+            return
+        self._cleanup_temp_dir(keep_input=True)
         self._temp_dir = tempfile.mkdtemp(prefix="vocal_sep_")
 
         # 禁用 UI
@@ -1135,8 +1153,12 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _on_play_original(self):
+        """主播放按钮: 播放 / 暂停 / 恢复 三态切换 (按钮文字随播放状态变化)。"""
         try:
-            if self._original_player.state == "paused":
+            state = self._original_player.state
+            if state == "playing":
+                self._original_player.pause()
+            elif state == "paused":
                 self._original_player.play(self._original_player.current_position())
             else:
                 self._original_player.play()
@@ -1380,13 +1402,21 @@ class MainWindow(QMainWindow):
         h, m, s = total // 3600, (total % 3600) // 60, total % 60
         return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
-    def _cleanup_temp_dir(self):
+    def _cleanup_temp_dir(self, keep_input: bool = False):
+        """清理临时目录与视频提取的临时音频。
+
+        keep_input=True 时保留当前正在使用的输入文件 (视频提取的临时 WAV
+        可能就是 self._input_file，删除会导致分离失败)。
+        """
         if self._temp_dir and os.path.isdir(self._temp_dir):
             try:
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
             except Exception:
                 pass
             self._temp_dir = None
+        if keep_input and self._video_extracted_wav == self._input_file:
+            # 当前输入就是该临时文件: 本次不删除，但保留引用以便后续清理
+            return
         if self._video_extracted_wav and os.path.isfile(self._video_extracted_wav):
             try:
                 os.remove(self._video_extracted_wav)

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """E2E: 用真实 htdemucs 模型 (CPU) 对 10s 合成音频跑完整分离流程。"""
-import os, sys, time, tempfile
+import os, sys, time, shutil, tempfile
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 import numpy as np
 import soundfile as sf
 
-tmp = tempfile.mkdtemp(prefix="qa_e2e_")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+tmp = tempfile.mkdtemp(prefix="qa_e2e_", dir=BASE_DIR)
 sr = 44100
 t = np.linspace(0, 10, 10 * sr, endpoint=False)
 mix = (0.4 * np.sin(2 * np.pi * 220 * t) + 0.3 * np.sin(2 * np.pi * 440 * t)
@@ -47,3 +48,4 @@ for name, path in done["stems"].items():
     assert abs(info.duration - 10.0) < 0.05, f"{name} 时长异常"
     assert info.channels == 2
 print("E2E PASS")
+shutil.rmtree(tmp, ignore_errors=True)

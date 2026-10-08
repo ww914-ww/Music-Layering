@@ -3,8 +3,10 @@
 """QA 功能验证脚本 - 对 vocal_separator.py 核心功能做离屏自动化测试。"""
 import os
 import sys
-import tempfile
+import time
 import shutil
+import tempfile
+import subprocess
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -18,7 +20,9 @@ def record(name, ok, note=""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name}: {note}")
 
 # ── 生成测试素材 ─────────────────────────────────────────────────────────
-tmp = tempfile.mkdtemp(prefix="qa_")
+# 注意: 临时目录建在项目目录内, 避免系统 Temp 目录偶发的写入干扰
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+tmp = tempfile.mkdtemp(prefix="qa_", dir=BASE_DIR)
 sr = 44100
 t = np.linspace(0, 5, 5 * sr, endpoint=False)
 sine = 0.5 * np.sin(2 * np.pi * 440 * t)
@@ -119,7 +123,7 @@ except Exception as e:
 win._load_audio_file(wav_stereo)
 
 # ── 6. 模拟分离完成 → stem 行与波形 ────────────────────────────────────
-stem_dir = tempfile.mkdtemp(prefix="qa_stems_")
+stem_dir = tempfile.mkdtemp(prefix="qa_stems_", dir=BASE_DIR)
 stems = {}
 for name in ["vocals", "drums", "bass", "other"]:
     p = os.path.join(stem_dir, f"{name}.wav")
@@ -245,6 +249,97 @@ try:
     record("窗口关闭清理", True, "closeEvent 无异常")
 except Exception as e:
     record("窗口关闭清理", False, str(e))
+
+# ── 15. H1 回归: 视频加载后临时音频不得被误删 ──────────────────────────
+from PyQt6.QtCore import Qt
+DC = Qt.ConnectionType.DirectConnection
+
+if shutil.which("ffmpeg"):
+    try:
+        video = os.path.join(tmp, "qa_video.mp4")
+        subprocess.run(["ffmpeg", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                        "-f", "lavfi", "-i", "color=c=blue:size=160x120:duration=3",
+                        "-pix_fmt", "yuv420p", "-y", video, "-loglevel", "error"],
+                       check=True, capture_output=True)
+        win._load_audio_file(video)
+        inp = win._input_file
+        exists_after_load = bool(inp) and os.path.isfile(inp)
+        # 模拟点击"开始分离"前的清理调用
+        win._cleanup_temp_dir(keep_input=True)
+        exists_after_start = os.path.isfile(inp)
+        record("H1 视频加载后临时音频未被误删", exists_after_load and exists_after_start,
+               f"加载后存在={exists_after_load}, 分离前清理后仍存在={exists_after_start}")
+        # 切换到新文件时，旧临时文件必须被清理
+        win._load_audio_file(wav_stereo)
+        record("H1 切换新文件时旧临时文件被清理", not os.path.isfile(inp),
+               "旧视频临时音频已删除，未泄漏磁盘")
+    except Exception as e:
+        record("H1 视频加载后临时音频未被误删", False, str(e))
+else:
+    record("H1 视频加载后临时音频未被误删", False, "未找到 ffmpeg，无法构造测试视频")
+
+# ── 16. H2 回归: 静音输入必须被拦截，不得产出 NaN 文件 ──────────────────
+# 注意: soundfile 要求数组形状为 (采样帧数, 声道数)，写成 (2, 44100) 会被
+# 解读为 44100 声道并触发 libsndfile "Format not recognised"
+try:
+    silent = os.path.join(tmp, "silent.wav")
+    sf.write(silent, np.zeros((44100, 2), dtype=np.float32), 44100)
+    sep_dir = tempfile.mkdtemp(prefix="qa_silent_", dir=BASE_DIR)
+    msgs = []
+    w = vs.AudioSeparationWorker(silent, sep_dir, model_name="htdemucs", device="cpu")
+    w.error_occurred.connect(lambda m: msgs.append(m), DC)
+    w.finished_separation.connect(lambda r: msgs.append("UNEXPECTED_SUCCESS"), DC)
+    w.run()  # 同步执行，避开事件循环依赖
+    produced = os.listdir(sep_dir)
+    ok = bool(msgs) and "UNEXPECTED_SUCCESS" not in msgs[0] and not produced
+    record("H2 静音输入被拦截", ok, f"提示={msgs[0][:28] if msgs else '无'}..., 产出文件数={len(produced)}")
+    shutil.rmtree(sep_dir, ignore_errors=True)
+except Exception as e:
+    record("H2 静音输入被拦截", False, str(e))
+
+# ── 17. H2 回归: 极低电平输入(近静音)同样被拦截 ────────────────────────
+try:
+    tiny = os.path.join(tmp, "near_silent.wav")
+    sf.write(tiny, (np.random.randn(44100, 2) * 1e-12).astype(np.float32), 44100)
+    sep_dir = tempfile.mkdtemp(prefix="qa_tiny_", dir=BASE_DIR)
+    msgs = []
+    w = vs.AudioSeparationWorker(tiny, sep_dir, model_name="htdemucs", device="cpu")
+    w.error_occurred.connect(lambda m: msgs.append(m), DC)
+    w.finished_separation.connect(lambda r: msgs.append("UNEXPECTED_SUCCESS"), DC)
+    w.run()
+    ok = bool(msgs) and "UNEXPECTED_SUCCESS" not in msgs[0] and not os.listdir(sep_dir)
+    record("H2 近静音输入被拦截", ok, f"提示={msgs[0][:28] if msgs else '无'}...")
+    shutil.rmtree(sep_dir, ignore_errors=True)
+except Exception as e:
+    record("H2 近静音输入被拦截", False, str(e))
+
+# ── 18. H3 回归: 主播放按钮三态切换 ────────────────────────────────────
+try:
+    win._load_audio_file(wav_stereo)
+    win._on_play_original()
+    s1 = win._original_player.state
+    btn1 = win._btn_play_orig.text()
+    time.sleep(0.4)
+    win._on_play_original()          # 按钮此时显示 "⏸ 暂停"，应真正暂停
+    s2 = win._original_player.state
+    pos = win._original_player.current_position()
+    win._on_play_original()          # 再次点击应恢复播放
+    s3 = win._original_player.state
+    win._on_stop_original()
+    ok = s1 == "playing" and s2 == "paused" and pos > 0.2 and s3 == "playing"
+    record("H3 主播放按钮三态切换", ok,
+           f"点击1→{s1}(按钮'{btn1}'), 点击2→{s2}@{pos:.2f}s, 点击3→{s3}")
+except Exception as e:
+    record("H3 主播放按钮三态切换", False, str(e))
+
+# ── 19. 回归: 修复后普通音频加载/分离准备流程不受影响 ──────────────────
+try:
+    win._load_audio_file(wav_stereo)
+    ok = (os.path.isfile(win._input_file) and win._btn_separate.isEnabled()
+          and len(win._original_waveform._tracks) == 1)
+    record("回归-普通音频加载流程", ok, f"input={os.path.basename(win._input_file or '')}")
+except Exception as e:
+    record("回归-普通音频加载流程", False, str(e))
 
 print("\n===== 汇总 =====")
 npass = sum(1 for _, r, _ in RESULTS if r == "正常")
